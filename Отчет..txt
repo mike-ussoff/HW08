@@ -1,0 +1,173 @@
+1. Создадим и запустим сервер Postgres с предустановленным расширением Postgres Message Queue (PGMQ)
+
+> docker run -d --name pgmq-postgres -e POSTGRES_PASSWORD=postgres -p 5432:5432 tembo.docker.scarf.sh/tembo/pg17-pgmq:latest
+
+2. Запустим командную строку и создадим очередь 
+
+> docker exec -it pgmq-postgres bash
+$psql
+postgres=# # CREATE EXTENSION pgmq;
+CREATE EXTENSION
+postgres=# SELECT pgmq.create('test_queue');
+ create
+--------
+
+(1 row)
+
+3. Отправим в очередь тестовое сообщение, затем прчитаем содержимое очереди и извлечем сообщение из очереди
+
+postgres=# SELECT * from pgmq.send(
+  queue_name  => 'test_queue',
+  msg         => '{"foo": "bar1"}'
+);
+ send
+------
+    1
+(1 row)
+
+postgres=# SELECT * FROM pgmq.read(
+  queue_name => 'test_queue',
+  vt         => 30,
+  qty        => 1
+);
+ msg_id | read_ct |          enqueued_at          |              vt               |     message
+--------+---------+-------------------------------+-------------------------------+-----------------
+      1 |       1 | 2024-11-10 02:14:59.640515+00 | 2024-11-10 02:17:30.448994+00 | {"foo": "bar1"}
+(1 row)
+
+postgres=# SELECT * FROM pgmq.pop('test_queue');
+ msg_id | read_ct |          enqueued_at          |              vt               |     message
+--------+---------+-------------------------------+-------------------------------+-----------------
+      1 |       1 | 2024-11-10 02:14:59.640515+00 | 2024-11-10 02:17:30.448994+00 | {"foo": "bar1"}
+(1 row)
+
+4. Очередь работает. Расширение PGMQ создало схему pgmq в базе Postgres и пару таблиц для обеспечения функциональности очереди (изображение "Pgmq.png").
+
+5. Проверим работоспособность из SSMS
+
+select *
+from openrowset('MSDASQL'
+	, 'Driver=PostgreSQL Unicode(x64);Server=127.0.0.1;port=5432;database=postgres;uid=postgres;pwd=postgres'
+	, 'select * from pgmq.send(''test_queue'',''{"foo": "bar1"}'');'
+	)
+
+send
+--------------------
+3
+
+(1 row affected)
+
+
+Completion time: 2024-11-10T15:50:10.8720134+03:00
+
+Сообщения в очередь ставятся.
+
+6. Создадим системный DSN
+
+Data Sourse: PostgreQueue
+Database: postgres
+Server: 127.0.0.1
+User Name: postgres
+Description: Postgresql queue test
+SSL Mode: prefer
+Port: 5432
+Password: postgres
+
+7. Создаем Linked Server
+
+exec sp_addlinkedserver @server = 'pg_wwi_queue'
+	, @srvproduct = 'PostgreSQL'
+	, @provider = 'MSDASQL'
+	, @datasrc = 'PostgreQueue'
+
+exec sp_addlinkedsrvlogin 'pg_wwi_queue', 'false', null, 'postgres', 'postgres'
+
+exec sp_serveroption @server=N'pg_wwi_queue', @optname=N'collation compatible', @optvalue=N'true'
+exec sp_serveroption @server=N'pg_wwi_queue', @optname=N'DATA ACCESS', @optvalue=N'true'
+exec sp_serveroption @server=N'pg_wwi_queue', @optname=N'RPC', @optvalue=N'true'
+exec sp_serveroption @server=N'pg_wwi_queue', @optname=N'RPC OUT', @optvalue=N'true'
+exec sp_serveroption @server=N'pg_wwi_queue', @optname=N'use remote collation', @optvalue=N'false'
+exec sp_serveroption @server=N'pg_wwi_queue', @optname=N'remote proc transaction promotion', @optvalue=N'false'
+
+8. Проверяем добавление в очередь.
+
+use WideWorldImporters;
+
+declare @queuename varchar(20) = 'test_queue';
+declare @message varchar(255) = 
+(
+select CustomerID, DeliveryInstructions from Sales.Invoices where InvoiceID = 1
+for json auto, ROOT(N'Invoices')
+);
+
+declare @cmd varchar(1024) = CONCAT('select * from pgmq.send(''', @queuename, ''',''', @message, ''')');
+
+EXEC (@cmd) AT pg_wwi_queue
+
+Результат на изображении "Send message.png"
+
+9. Настраиваем сервисы, очереди, контракты и пр.
+
+USE master
+ALTER DATABASE WideWorldImporters
+SET ENABLE_BROKER  WITH ROLLBACK IMMEDIATE;
+
+ALTER DATABASE WideWorldImporters SET TRUSTWORTHY ON;
+
+ALTER AUTHORIZATION ON DATABASE::WideWorldImporters TO [sa];
+
+USE WideWorldImporters;
+
+CREATE MESSAGE TYPE [//WWI/SB/RequestMessage];
+
+CREATE MESSAGE TYPE [//WWI/SB/ReplyMessage];
+
+CREATE CONTRACT [//WWI/SB/Contract]
+      ([//WWI/SB/RequestMessage]
+         SENT BY INITIATOR,
+       [//WWI/SB/ReplyMessage]
+         SENT BY TARGET
+      );
+
+CREATE QUEUE TargetQueueWWI;
+
+CREATE SERVICE [//WWI/SB/TargetService] ON QUEUE TargetQueueWWI ([//WWI/SB/Contract]);
+
+CREATE QUEUE InitiatorQueueWWI;
+
+CREATE SERVICE [//WWI/SB/InitiatorService] ON QUEUE InitiatorQueueWWI ([//WWI/SB/Contract]);
+
+10. Процедура отправки сообщения в очередль MS SQL
+
+Файл SendMessageToPostgresQueue.sql
+
+11. Процедура получения сообщения из очереди MS SQL и отправка его в очередь Postgres
+
+Файл GetMessageToPostgresQueue.sql
+
+12. Процедура подтверждения ответа.
+
+Файл ConfirmInvoice.sql
+
+13. Переводим очереди в режим автоматической обрабоки
+
+ALTER QUEUE [dbo].[InitiatorQueueWWI] WITH STATUS = ON , RETENTION = OFF , POISON_MESSAGE_HANDLING (STATUS = OFF) 
+	, ACTIVATION (STATUS = ON, PROCEDURE_NAME = Sales.ConfirmInvoice, MAX_QUEUE_READERS = 1, EXECUTE AS OWNER);
+
+ALTER QUEUE [dbo].[TargetQueueWWI] WITH STATUS = ON , RETENTION = OFF , POISON_MESSAGE_HANDLING (STATUS = OFF)
+	, ACTIVATION (  STATUS = ON, PROCEDURE_NAME = Sales.GetMessageToPostgresQueue, MAX_QUEUE_READERS = 1, EXECUTE AS OWNER); 
+
+14. Проверяем в работе.
+
+Изображение "QueueTesting.png"
+
+
+
+
+
+
+
+
+
+
+
